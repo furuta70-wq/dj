@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- fes DJ v1.54.1: native fallback sampler + non-blocking start -->
+<!-- fes DJ v1.55: transport stability + audio cleanup -->
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
@@ -5470,6 +5470,7 @@ function getFourBeatTransportPosition(){
 
 function getPerformanceTime(){
   if(scratchState)return scratchState.scratchCursor||0;
+  if(searchState)return searchState.cursor||0;
   if(fourBeatLoop.source&&fourBeatLoop.audioActive)return getFourBeatTransportPosition();
   return mainAudio.currentTime||0;
 }
@@ -5538,6 +5539,84 @@ function makeLoopSource(start,end,ctxStart,offsetStart){
 
   src.start(ctxStart,offsetStart);
   return {src,gain};
+}
+
+
+function startForwardBufferTransport(position,fadeIn=.010){
+  const ctx=ensureFxContext();
+  if(!ctx||!scratchBuffer)return false;
+
+  if(fourBeatLoop.source){
+    stopFourBeatSource(false);
+  }
+  clearFourBeatTimers();
+
+  const d=trackMeta.duration||scratchBuffer.duration||0;
+  const pos=clamp(position||0,0,Math.max(0,d-.015));
+  const src=ctx.createBufferSource();
+  const gain=ctx.createGain();
+  src.buffer=scratchBuffer;
+  src.playbackRate.value=1;
+  src.loop=false;
+  connectFourBeatSource(src,gain);
+
+  const now=ctx.currentTime;
+  const level=clamp(settings.master,0,1);
+  gain.gain.setValueAtTime(0,now);
+  gain.gain.linearRampToValueAtTime(level,now+Math.max(.004,fadeIn));
+
+  fourBeatLoop.source=src;
+  fourBeatLoop.gain=gain;
+  fourBeatLoop.mode='forward';
+  fourBeatLoop.audioActive=true;
+  fourBeatLoop.ctxStart=now;
+  fourBeatLoop.offsetStart=pos;
+  fourBeatLoop.linearAnchorCtx=now;
+  fourBeatLoop.linearAnchorPos=pos;
+  fourBeatLoop.exitBoundaryCtx=0;
+  fourBeatLoop.wrapPending=false;
+  fourBeatLoop.lastVisualBeat=-1;
+
+  try{
+    mainAudio.pause();
+    mainAudio.muted=true;
+  }catch{}
+
+  src.onended=()=>{
+    if(fourBeatLoop.source!==src)return;
+    fourBeatLoop.source=null;
+    fourBeatLoop.gain=null;
+    fourBeatLoop.audioActive=false;
+    fourBeatLoop.mode='off';
+    disconnectAudioNode(src);
+    disconnectAudioNode(gain);
+    try{
+      mainAudio.muted=false;
+      mainAudio.pause();
+      if(d)mainAudio.currentTime=Math.max(0,d-.02);
+    }catch{}
+    setPlayingUI(false);
+    visualSpeed=0;
+    updateFourBeatLoopUI(d||0);
+  };
+
+  try{
+    src.start(now,pos);
+    setPlayingUI(true);
+    visualSpeed=1;
+    return true;
+  }catch(e){
+    console.warn('Forward transport start failed',e);
+    try{src.onended=null;src.stop();}catch{}
+    disconnectAudioNode(src);
+    disconnectAudioNode(gain);
+    fourBeatLoop.source=null;
+    fourBeatLoop.gain=null;
+    fourBeatLoop.audioActive=false;
+    fourBeatLoop.mode='off';
+    try{mainAudio.muted=false;}catch{}
+    return false;
+  }
 }
 
 
@@ -6159,17 +6238,13 @@ function armFourBeatLoop(){
     return;
   }
 
-  // First LOOP: native player carries the song until just before the next beat.
-  // WebAudio then takes over for only a tiny pre-roll and performs all later loops.
-  const delta=Math.max(.025,end-nowTrack);
-  const pre=Math.min(.028,Math.max(.014,delta*.20));
-  const startIn=Math.max(.006,delta-pre);
-  const ctxStart=ctx.currentTime+startIn;
-  const offsetStart=clamp(end-pre,start,Math.max(start,end-.002));
-
+  // First LOOP: move to the same WebAudio clock immediately.
+  // The old timer-based native -> WebAudio handoff could run late on iPad,
+  // producing a brief duplicate or jump at the loop boundary.
   let created;
-  try{created=makeLoopSource(start,end,ctxStart,offsetStart);}
-  catch(e){
+  try{
+    created=makeLoopSource(start,end,ctx.currentTime,nowTrack);
+  }catch(e){
     console.warn('4 BEAT LOOP start failed',e);
     fourBeatLoop.mode='off';
     return;
@@ -6177,8 +6252,10 @@ function armFourBeatLoop(){
 
   fourBeatLoop.source=created.src;
   fourBeatLoop.gain=created.gain;
-  fourBeatLoop.ctxStart=ctxStart;
-  fourBeatLoop.offsetStart=offsetStart;
+  fourBeatLoop.ctxStart=ctx.currentTime;
+  fourBeatLoop.offsetStart=nowTrack;
+  fourBeatLoop.audioActive=true;
+  fourBeatLoop.wrapPending=false;
 
   fourBeatLoop.source.onended=()=>{
     if(fourBeatLoop.source!==created.src)return;
@@ -6188,26 +6265,22 @@ function armFourBeatLoop(){
     updateFourBeatLoopUI(mainAudio.currentTime||0);
   };
 
+  // Stop the native player now, not via a future JS timer.
+  // From here through LOOP and LOOP release, one clock owns the song.
+  try{
+    mainAudio.muted=true;
+    mainAudio.pause();
+  }catch{}
+  setPlayingUI(true);
+
   clearFourBeatTimers();
-
-  fourBeatLoop.startTimer=setTimeout(()=>{
-    if(fourBeatLoop.mode!=='armed'||fourBeatLoop.source!==created.src)return;
-    fourBeatLoop.audioActive=true;
-    fourBeatLoop.wrapPending=true;
-    try{
-      mainAudio.muted=true;
-      mainAudio.pause();
-    }catch{}
-    setPlayingUI(true);
-  },Math.max(0,startIn*1000-2));
-
+  const delay=Math.max(.006,end-nowTrack);
   fourBeatLoop.activeTimer=setTimeout(()=>{
     if(fourBeatLoop.mode!=='armed'||fourBeatLoop.source!==created.src)return;
     fourBeatLoop.mode='active';
-    fourBeatLoop.wrapPending=false;
     playLoopCaptureVisual();
     updateFourBeatLoopUI(getFourBeatTransportPosition());
-  },delta*1000);
+  },delay*1000);
 
   updateFourBeatLoopUI(nowTrack);
 }
@@ -6661,6 +6734,22 @@ function ensureFxContext(){
   if(fxCtx&&fxCtx.state==='suspended') fxCtx.resume().catch(()=>{});
   return fxCtx;
 }
+
+function disconnectAudioNode(node){
+  if(!node)return;
+  try{node.disconnect();}catch{}
+}
+function cleanupTransientVoice(src,...nodes){
+  if(!src)return;
+  const cleanup=()=>{
+    disconnectAudioNode(src);
+    nodes.forEach(disconnectAudioNode);
+  };
+  try{src.addEventListener('ended',cleanup,{once:true});}
+  catch{
+    try{src.onended=cleanup;}catch{}
+  }
+}
 async function prepareFxBuffer(){
   if(scratchBuffer||!trackBlobCache) return scratchBuffer;
   if(fxDecodePromise) return fxDecodePromise;
@@ -7065,6 +7154,7 @@ function playFxSlice(offset,duration,rate=1,gain=.25,delay=0,reverse=false){
   const ctx=ensureFxContext(),buf=reverse?reverseBuffer:scratchBuffer;if(!ctx||!buf)return;
   const src=ctx.createBufferSource(),g=ctx.createGain();src.buffer=buf;src.playbackRate.value=Math.max(.12,Math.min(4,Math.abs(rate)||1));g.gain.value=gain;src.connect(g).connect(ctx.destination);
   let off=reverse?Math.max(0,buf.duration-offset):offset;off=clamp(off,0,Math.max(0,buf.duration-.02));
+  cleanupTransientVoice(src,g);
   try{src.start(ctx.currentTime+delay,off,Math.min(duration,Math.max(.02,buf.duration-off)));}catch{}
 }
 
@@ -7093,6 +7183,7 @@ function playScratchGrain(position,velocity){
   g.gain.setValueAtTime(level,t+Math.max(attack,grainDur-release));
   g.gain.linearRampToValueAtTime(0,t+grainDur);
 
+  cleanupTransientVoice(src,g);
   try{src.start(t,off,grainDur);src.stop(t+grainDur+.01);return true}catch{return false}
 }
 
@@ -7140,7 +7231,15 @@ function startScratchVoice(position,velocity,fadeIn=.010){
   gain.gain.linearRampToValueAtTime(level,now+fadeIn);
 
   try{src.start(now,off)}catch{return false}
-  scratchVoice={ctx,src,gain,reverse,rate,lastCtx:now,logicalPos:position};
+  const voice={ctx,src,gain,reverse,rate,lastCtx:now,logicalPos:position};
+  scratchVoice=voice;
+  try{
+    src.addEventListener('ended',()=>{
+      disconnectAudioNode(src);
+      disconnectAudioNode(gain);
+      if(scratchVoice===voice)scratchVoice=null;
+    },{once:true});
+  }catch{}
   return true;
 }
 function replaceScratchVoice(position,velocity,fade=.018){
@@ -7248,27 +7347,44 @@ function cancelBackspin(){
   backspinState=null;
   $('#deck').classList.remove('backspinning');
 }
-function resumeAfterVinylGesture(wasPlaying){
+function resumeAfterVinylGesture(wasPlaying,cursor=null){
   $('#deck').classList.remove('scratching','searching');
-  visualSpeed=wasPlaying?.72:0;
-  if(!wasPlaying){setPlayingUI(false);return Promise.resolve();}
+  const pos=Number.isFinite(cursor)?cursor:getPerformanceTime();
+
+  if(!wasPlaying){
+    visualSpeed=0;
+    setPlayingUI(false);
+    try{
+      mainAudio.muted=false;
+      if(Number.isFinite(pos))mainAudio.currentTime=pos;
+      mainAudio.pause();
+    }catch{}
+    return Promise.resolve();
+  }
+
+  // Scratch/search release stays on the already-decoded AudioBuffer clock.
+  // No HTMLAudio seek + immediate play race, so there is no old fragment replay.
+  if(startForwardBufferTransport(pos,.010)){
+    return Promise.resolve();
+  }
+
+  // Rare fallback if WebAudio is unavailable.
   try{
-    mainAudio.playbackRate=.72;
+    mainAudio.muted=false;
+    mainAudio.currentTime=pos;
     const p=mainAudio.play();
     return Promise.resolve(p).then(()=>{
       setPlayingUI(true);
-      const start=performance.now(),dur=145;
-      const ramp=now=>{
-        const x=clamp((now-start)/dur,0,1),e=1-Math.pow(1-x,2.3);
-        const rate=.72+.28*e;
-        try{mainAudio.playbackRate=rate}catch{}
-        visualSpeed=rate;
-        if(x<1)requestAnimationFrame(ramp);
-        else{try{mainAudio.playbackRate=1}catch{}visualSpeed=1;}
-      };
-      requestAnimationFrame(ramp);
-    }).catch(()=>{setPlayingUI(false);visualSpeed=0;});
-  }catch{setPlayingUI(false);visualSpeed=0;return Promise.resolve();}
+      visualSpeed=1;
+    }).catch(()=>{
+      setPlayingUI(false);
+      visualSpeed=0;
+    });
+  }catch{
+    setPlayingUI(false);
+    visualSpeed=0;
+    return Promise.resolve();
+  }
 }
 
 /* Two-finger SEARCH now follows the geometry of the platter:
@@ -7278,26 +7394,32 @@ function beginTwoFingerSearch(){
   if(searchState||platterPointers.size<2)return;
   cancelBackspin();
   stopScratchVoice(.010);
+
   const c=platterCenter();
   const entries=[...platterPointers.entries()].slice(0,2);
   const angles={};
-  for(const [id,p] of entries) angles[id]=angleAtPoint(p.x,p.y,c);
-  const was=scratchState?scratchState.wasPlaying:!mainAudio.paused;
-  if(scratchState){
-    try{mainAudio.currentTime=scratchState.scratchCursor||0}catch{}
-  }
+  for(const [id,p] of entries)angles[id]=angleAtPoint(p.x,p.y,c);
+
+  const cursor=scratchState
+    ? (scratchState.scratchCursor||0)
+    : getPerformanceTime();
+  const was=scratchState
+    ? scratchState.wasPlaying
+    : deckIsPlaying();
+
   searchState={
-    startTime:mainAudio.currentTime||0,
-    cursor:mainAudio.currentTime||0,
+    startTime:cursor,
+    cursor,
     wasPlaying:was,
     accumAngle:0,
     lastAngles:angles,
     lastT:performance.now(),
     waitingForRelease:false
   };
+
   scratchState=null;
   cancelScratchVisual();
-  try{mainAudio.pause()}catch{}
+  try{mainAudio.pause();}catch{}
   if(was)setPlayingUI(true);
   visualSpeed=0;
   $('#deck').classList.remove('scratching');
@@ -8262,8 +8384,13 @@ function platterDown(e){
   let transferredPos=null;
 
   if(fourBeatLoop.mode==='forward'&&fourBeatLoop.source){
-    transferredPos=transferForwardTransportToNativePaused();
-    transferredForward=transferredPos!=null;
+    transferredPos=getFourBeatTransportPosition();
+    stopFourBeatSource(false);
+    fourBeatLoop.mode='off';
+    fourBeatLoop.start=0;
+    fourBeatLoop.end=0;
+    fourBeatLoop.beatDur=0;
+    transferredForward=Number.isFinite(transferredPos);
   }
 
   // While the four-beat loop itself owns the deck, keep one audio clock only.
@@ -8358,7 +8485,6 @@ function platterMove(e){
         const gain=clamp(.10+Math.pow(omega/1.2,1.5)*.90,.10,2.20);
         const delta=(da/(Math.PI*2))*d*gain;
         searchState.cursor=clamp((searchState.cursor||0)+delta,0,Math.max(0,d-.01));
-        mainAudio.currentTime=searchState.cursor;
         updateTimeline();
       }
     }
@@ -8462,8 +8588,9 @@ async function platterEnd(e){
     searchState.waitingForRelease=true;
     if(platterPointers.size===0){
       const was=searchState.wasPlaying;
+      const cursor=searchState.cursor||0;
       searchState=null;
-      await resumeAfterVinylGesture(was);
+      await resumeAfterVinylGesture(was,cursor);
     }
     return;
   }
@@ -8477,18 +8604,22 @@ async function platterEnd(e){
   endScratchVisual();
   endScratchSurfaceVisual();
 
-  try{mainAudio.currentTime=cursor;mainAudio.playbackRate=1;applyTransitionAudio(true);}catch{}
+  try{mainAudio.playbackRate=1;applyTransitionAudio(true);}catch{}
 
-  // Reverse scratching must never turn into a stopped deck.
-  // BACKSPIN is no longer auto-triggered by a reverse flick; every normal scratch release
-  // returns to forward playback from the exact scratch end position.
+  // Continue from the exact scratch cursor on the same decoded buffer clock.
+  // HTMLAudio currentTime seek + immediate play was the source of short repeats/jumps.
   if(was){
-    try{
-      const p=mainAudio.play();
-      Promise.resolve(p).then(()=>{setPlayingUI(true);visualSpeed=1;}).catch(()=>{setPlayingUI(false);visualSpeed=0;});
-    }catch{setPlayingUI(false);visualSpeed=0;}
+    if(!startForwardBufferTransport(cursor,.010)){
+      await resumeAfterVinylGesture(true,cursor);
+    }
   }else{
-    setPlayingUI(false);visualSpeed=0;
+    try{
+      mainAudio.muted=false;
+      mainAudio.currentTime=cursor;
+      mainAudio.pause();
+    }catch{}
+    setPlayingUI(false);
+    visualSpeed=0;
   }
   updateTimeline();
 }
@@ -8513,29 +8644,31 @@ function samplerSlotNativeSrc(slot){
   return slot?.nativeSrc||slot?.src||'';
 }
 
+function createNativeSamplerAudio(slot){
+  const src=samplerSlotNativeSrc(slot);
+  if(!src)return null;
+  const a=document.createElement('audio');
+  a.preload='auto';
+  a.playsInline=true;
+  a.setAttribute('playsinline','');
+  a.setAttribute('webkit-playsinline','');
+  a.src=src;
+  a.volume=1;
+  a.style.display='none';
+  document.body.appendChild(a);
+  try{a.load();}catch{}
+  return a;
+}
+
 function buildNativePadPools(){
   samplerNativePools.clear();
   samplerNativeCursor.clear();
 
+  // One warm element per sound is enough initially.
+  // Extra voices are created only if the user actually overlaps that sound.
   allSamplerSlots().forEach(slot=>{
-    const src=samplerSlotNativeSrc(slot);
-    if(!src)return;
-
-    const pool=Array.from({length:6},()=>{
-      const a=document.createElement('audio');
-      a.preload='auto';
-      a.playsInline=true;
-      a.setAttribute('playsinline','');
-      a.setAttribute('webkit-playsinline','');
-      a.src=src;
-      a.volume=1;
-      a.style.display='none';
-      document.body.appendChild(a);
-      try{a.load();}catch{}
-      return a;
-    });
-
-    samplerNativePools.set(slot.id,pool);
+    const first=createNativeSamplerAudio(slot);
+    samplerNativePools.set(slot.id,first?[first]:[]);
     samplerNativeCursor.set(slot.id,0);
   });
 
@@ -8544,14 +8677,25 @@ function buildNativePadPools(){
 
 function startNativeSamplerVoice(slot){
   if(!slot)return false;
-  const pool=samplerNativePools.get(slot.id);
-  if(!pool||!pool.length)return false;
+  let pool=samplerNativePools.get(slot.id);
+  if(!pool){
+    pool=[];
+    samplerNativePools.set(slot.id,pool);
+  }
 
-  const cur=samplerNativeCursor.get(slot.id)||0;
-  const idx=cur%pool.length;
-  samplerNativeCursor.set(slot.id,(idx+1)%pool.length);
+  // Prefer a free decoder. Grow lazily to at most three voices per sound.
+  let a=pool.find(v=>v.paused||v.ended);
+  if(!a&&pool.length<3){
+    a=createNativeSamplerAudio(slot);
+    if(a)pool.push(a);
+  }
+  if(!a&&pool.length){
+    const cur=samplerNativeCursor.get(slot.id)||0;
+    a=pool[cur%pool.length];
+    samplerNativeCursor.set(slot.id,(cur+1)%pool.length);
+  }
+  if(!a)return false;
 
-  const a=pool[idx];
   try{
     a.pause();
     a.currentTime=0;
@@ -8650,28 +8794,11 @@ function primeAllNativeSamplerVoices(){
   if(allNativeSamplerPrimeStarted)return;
   allNativeSamplerPrimeStarted=true;
 
+  // Do not play/pause every element here. On iPad that creates a media pipeline
+  // for every sampler voice and is a major source of progressive slowdown.
   samplerNativePools.forEach(pool=>{
     const a=pool?.[0];
-    if(!a)return;
-    try{
-      a.muted=true;
-      a.volume=0;
-      a.currentTime=0;
-      const p=a.play();
-      Promise.resolve(p).then(()=>{
-        try{
-          a.pause();
-          a.currentTime=0;
-          a.muted=false;
-          a.volume=1;
-        }catch{}
-      }).catch(()=>{
-        try{
-          a.muted=false;
-          a.volume=1;
-        }catch{}
-      });
-    }catch{}
+    try{a?.load();}catch{}
   });
 }
 
@@ -8753,7 +8880,9 @@ function warmSamplerContextNow(){
 function silentUnlockPulse(ctx){
   try{
     const b=ctx.createBuffer(1,1,ctx.sampleRate||44100),src=ctx.createBufferSource(),g=ctx.createGain();
-    g.gain.value=0;src.buffer=b;src.connect(g).connect(ctx.destination);src.start(0);
+    g.gain.value=0;src.buffer=b;src.connect(g).connect(ctx.destination);
+    cleanupTransientVoice(src,g);
+    src.start(0);
   }catch{}
 }
 
@@ -9534,6 +9663,7 @@ function startSynthBufferVoice(slot,delaySec=0){
   g.gain.value=1;
   src.connect(g).connect(padBus);
 
+  cleanupTransientVoice(src,g);
   try{
     src.start(padCtx.currentTime+Math.max(0,delaySec));
     return true;
@@ -9641,6 +9771,7 @@ function startPadVoice(i,delaySec=0){
   const preset=ACTIVE_PAD_PRESETS[i].gain??.8;
   g.gain.value=clamp(preset*(padTrims[i]||1),.12,1.25);
   src.connect(g).connect(padBus);
+  cleanupTransientVoice(src,g);
   try{
     src.start(padCtx.currentTime+Math.max(0,delaySec));
     return true;
@@ -10164,7 +10295,7 @@ updateSamplerBankUI();
 // and must not gate the four sampler pads.
 bootstrapSampler();
 
-setInterval(updatePerformanceReadiness,350);
+setInterval(updatePerformanceReadiness,850);
 setInterval(enforceDeckInvariants,500);
 restore();
 })();
