@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<title>FES VINYL v1.50.5 PERFORMANCE</title>
+<title>FES VINYL v1.50.6 PERFORMANCE</title>
 <style>
   :root{
     --accent:#ff2d55;
@@ -4218,7 +4218,70 @@
     100%{opacity:0}
   }
 </style>
+
+<style id="v1506-ipad-viewport-lock">
+  html,
+  body{
+    margin:0!important;
+    padding:0!important;
+    width:100%!important;
+    height:100%!important;
+    overflow:hidden!important;
+    overscroll-behavior:none!important;
+    touch-action:none!important;
+    -webkit-user-select:none!important;
+    user-select:none!important;
+    -webkit-touch-callout:none!important;
+    -webkit-text-size-adjust:100%!important;
+  }
+
+  html{
+    background:#000!important;
+  }
+
+  body{
+    position:fixed!important;
+    inset:0!important;
+    width:100vw!important;
+    height:100dvh!important;
+    max-width:100vw!important;
+    max-height:100dvh!important;
+  }
+
+  #app,
+  .deck,
+  .vinylView,
+  #recordStage,
+  #record,
+  #beatPhraseRing,
+  #samplerArc,
+  .radialSampler,
+  .fourBeatLoop,
+  .transitionArcWrap,
+  .deckColorSwitch{
+    overscroll-behavior:none!important;
+    touch-action:none!important;
+    -webkit-user-select:none!important;
+    user-select:none!important;
+    -webkit-touch-callout:none!important;
+  }
+
+  /* Only the settings panel is intentionally scrollable. */
+  .panelBody{
+    overscroll-behavior:contain!important;
+    touch-action:pan-y!important;
+    -webkit-overflow-scrolling:touch!important;
+  }
+
+  input,
+  textarea,
+  select{
+    -webkit-user-select:text!important;
+    user-select:text!important;
+  }
+</style>
 </head>
+
 
 
 
@@ -6821,6 +6884,8 @@ function updateScratchTouchCore(e,energy=scratchSurfaceVisual.energy,velocity=0)
 function fastScratchSurfacePointer(e){
   const s=scratchSurfaceVisual;
   if(!s.active||e.pointerId!==s.pointerId)return;
+  if(e.cancelable)e.preventDefault();
+
   let p=e;
   try{
     const c=e.getCoalescedEvents?.();
@@ -8500,6 +8565,42 @@ document.addEventListener('selectstart',e=>{
 document.addEventListener('dragstart',e=>e.preventDefault(),{capture:true});
 document.addEventListener('gesturestart',e=>e.preventDefault(),{passive:false});
 
+
+/* Keep iPad Safari / Quick Look from panning, rubber-banding or zooming
+   while the user is performing on the deck. */
+function isIntentionalScrollSurface(target){
+  return !!target?.closest?.('.panelBody');
+}
+
+document.addEventListener('touchmove',e=>{
+  if(isIntentionalScrollSurface(e.target))return;
+  if(e.cancelable)e.preventDefault();
+},{
+  capture:true,
+  passive:false
+});
+
+['gesturestart','gesturechange','gestureend'].forEach(type=>{
+  document.addEventListener(type,e=>{
+    if(e.cancelable)e.preventDefault();
+  },{
+    capture:true,
+    passive:false
+  });
+});
+
+// If the browser still creates a tiny rubber-band offset, pin it back immediately.
+let viewportPinRAF=0;
+function pinViewportOrigin(){
+  viewportPinRAF=0;
+  if(window.scrollX!==0||window.scrollY!==0){
+    window.scrollTo(0,0);
+  }
+}
+window.addEventListener('scroll',()=>{
+  if(!viewportPinRAF)viewportPinRAF=requestAnimationFrame(pinViewportOrigin);
+},{passive:true});
+
 window.addEventListener('pageshow',()=>{
   requestStageWakeLock();
   rearmAudioContexts();
@@ -8544,9 +8645,13 @@ $('#brakeBtn').addEventListener('click',doBrake);
 $('#echoBtn').addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();try{e.currentTarget.setPointerCapture(e.pointerId);}catch{}echoOn();});
 ['pointerup','pointercancel','lostpointercapture'].forEach(ev=>$('#echoBtn').addEventListener(ev,e=>{e.stopPropagation();echoOff();}));
 const scratchFxStage=$('#recordStage');
-scratchFxStage?.addEventListener('pointermove',fastScratchSurfacePointer,{capture:true,passive:true});
-scratchFxStage?.addEventListener('pointerrawupdate',fastScratchSurfacePointer,{capture:true,passive:true});
-$('#record').addEventListener('pointerdown',platterDown);$('#record').addEventListener('pointermove',platterMove);['pointerup','pointercancel','lostpointercapture'].forEach(ev=>$('#record').addEventListener(ev,platterEnd));
+scratchFxStage?.addEventListener('pointermove',fastScratchSurfacePointer,{capture:true,passive:false});
+scratchFxStage?.addEventListener('pointerrawupdate',fastScratchSurfacePointer,{capture:true,passive:false});
+$('#record').addEventListener('pointerdown',platterDown,{passive:false});
+$('#record').addEventListener('pointermove',platterMove,{passive:false});
+['pointerup','pointercancel','lostpointercapture'].forEach(ev=>
+  $('#record').addEventListener(ev,platterEnd,{passive:false})
+);
 
 // Legacy hidden controls kept harmless for DOM compatibility.
 $('#cutBtn').addEventListener('click',()=>{});$('#cueBtn').addEventListener('pointerdown',()=>{});$$('.loopBtn').forEach(b=>b.addEventListener('click',()=>{}));
